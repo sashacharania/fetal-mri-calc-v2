@@ -5,11 +5,19 @@
  * differential-diagnosis cards. Hairline rules. Deep teal accent. Serif
  * display + sans body + monospace numerics.
  */
-import { useMemo, useState, useEffect, useRef } from "react";
+import { useMemo, useState, useEffect, useRef, type FormEvent } from "react";
 import { Link } from "wouter";
 import { motion, AnimatePresence } from "framer-motion";
 import { toast } from "sonner";
-import { ChevronDown, Copy, RotateCcw, BookOpen, Sparkles } from "lucide-react";
+import {
+  ChevronDown,
+  Copy,
+  RotateCcw,
+  BookOpen,
+  Loader2,
+  Send,
+  Sparkles,
+} from "lucide-react";
 
 import {
   Collapsible,
@@ -156,6 +164,206 @@ function extractRagAnswer(payload: unknown): string {
 
   const answer = (payload as { answer?: unknown }).answer;
   return typeof answer === "string" ? answer.trim() : "";
+}
+
+type RagSource = {
+  citation: string;
+  title: string;
+  pageLabel: string;
+  sourceId: string;
+  score: number;
+};
+
+type ChatMessage = {
+  role: "user" | "assistant";
+  content: string;
+  sources: RagSource[];
+};
+
+function extractRagSources(payload: unknown): RagSource[] {
+  if (
+    typeof payload !== "object" ||
+    payload === null ||
+    !("sources" in payload) ||
+    !Array.isArray((payload as { sources?: unknown }).sources)
+  ) {
+    return [];
+  }
+
+  return (payload as { sources: unknown[] }).sources
+    .map(source => {
+      if (typeof source !== "object" || source === null) {
+        return null;
+      }
+      const raw = source as Record<string, unknown>;
+      return {
+        citation: typeof raw.citation === "string" ? raw.citation.trim() : "",
+        title: typeof raw.title === "string" ? raw.title.trim() : "",
+        pageLabel:
+          typeof raw.pageLabel === "string" ? raw.pageLabel.trim() : "",
+        sourceId: typeof raw.sourceId === "string" ? raw.sourceId.trim() : "",
+        score:
+          typeof raw.score === "number" ? raw.score : Number(raw.score ?? 0),
+      } satisfies RagSource;
+    })
+    .filter(
+      (source): source is RagSource => source !== null && source.citation !== ""
+    );
+}
+
+function LiteratureChatPanel({ report }: { report: string }) {
+  const [messages, setMessages] = useState<ChatMessage[]>([
+    {
+      role: "assistant",
+      content:
+        "Ask a fetal MRI literature question. I’ll answer from the same RAG corpus used by the report workflow and keep [C1], [C2], etc. citations in the reply.",
+      sources: [],
+    },
+  ]);
+  const [draft, setDraft] = useState("");
+  const [isSending, setIsSending] = useState(false);
+  const endRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+  }, [messages, isSending]);
+
+  const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const question = draft.trim();
+    if (!question || isSending) return;
+
+    setDraft("");
+    setMessages(prev => [
+      ...prev,
+      { role: "user", content: question, sources: [] },
+    ]);
+    setIsSending(true);
+
+    try {
+      const response = await fetch("/api/rag/chat", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ question, report }),
+      });
+
+      if (!response.ok) {
+        throw new Error(`Chat request failed with ${response.status}`);
+      }
+
+      const payload: unknown = await response.json();
+      const answer = extractRagAnswer(payload);
+      const sources = extractRagSources(payload);
+
+      setMessages(prev => [
+        ...prev,
+        {
+          role: "assistant",
+          content:
+            answer ||
+            "I couldn’t retrieve a grounded answer for that question.",
+          sources,
+        },
+      ]);
+    } catch {
+      setMessages(prev => [
+        ...prev,
+        {
+          role: "assistant",
+          content:
+            "The literature chat is temporarily unavailable. Please try again in a moment.",
+          sources: [],
+        },
+      ]);
+    } finally {
+      setIsSending(false);
+    }
+  };
+
+  return (
+    <article className="bg-white border border-[color:var(--rule)] rounded-sm">
+      <header className="flex items-center justify-between border-b border-[color:var(--rule)] px-5 py-3">
+        <div>
+          <div className="smallcaps text-[color:var(--teal)]">
+            Literature Chat
+          </div>
+          <div className="font-display text-[15px] mt-0.5">
+            RAG-backed literature assistant
+          </div>
+        </div>
+      </header>
+
+      <div className="px-5 py-4 space-y-4">
+        <div className="max-h-[320px] overflow-auto space-y-3 pr-1">
+          {messages.map((message, index) => (
+            <div
+              key={`${message.role}-${index}`}
+              className={`flex ${message.role === "user" ? "justify-end" : "justify-start"}`}
+            >
+              <div
+                className={`max-w-[92%] rounded-sm border px-3 py-2 text-[12.5px] leading-relaxed ${
+                  message.role === "user"
+                    ? "bg-[color:var(--teal)] text-[color:var(--paper)] border-[color:var(--teal)]"
+                    : "bg-[color:var(--paper)]/40 text-[color:var(--ink)] border-[color:var(--rule)]"
+                }`}
+              >
+                <div className="whitespace-pre-wrap">{message.content}</div>
+                {message.role === "assistant" && message.sources.length > 0 ? (
+                  <div className="mt-3 border-t border-[color:var(--rule)] pt-3">
+                    <div className="smallcaps text-[10px] text-[color:var(--ink-soft)] mb-2">
+                      Sources
+                    </div>
+                    <ul className="space-y-2 text-[11px] text-[color:var(--ink-soft)]">
+                      {message.sources.map(source => (
+                        <li key={source.citation} className="leading-snug">
+                          <span className="font-semibold text-[color:var(--ink)]">
+                            [{source.citation}]
+                          </span>{" "}
+                          {source.title}
+                          {source.pageLabel ? ` · ${source.pageLabel}` : ""}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                ) : null}
+              </div>
+            </div>
+          ))}
+          <div ref={endRef} />
+        </div>
+
+        <form onSubmit={handleSubmit} className="space-y-2">
+          <textarea
+            aria-label="Literature chat question"
+            value={draft}
+            onChange={e => setDraft(e.target.value)}
+            placeholder="Ask about fetal ventriculomegaly, corpus callosum, posterior fossa, thresholds, or reporting language..."
+            rows={3}
+            className="w-full resize-none rounded-sm border border-[color:var(--rule)] bg-white px-3 py-2 text-[12.5px] leading-relaxed text-[color:var(--ink)] outline-none focus:border-[color:var(--teal)]"
+          />
+          <div className="flex items-center justify-between gap-3">
+            <div className="text-[11px] text-[color:var(--ink-soft)]">
+              Answers are grounded in the same indexed corpus as the report.
+            </div>
+            <button
+              type="submit"
+              disabled={isSending || !draft.trim()}
+              className="inline-flex items-center gap-1.5 rounded-sm bg-[color:var(--teal)] px-3 py-1.5 text-xs smallcaps text-[color:var(--paper)] transition-colors hover:bg-[color:var(--ink)] disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {isSending ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <Send className="h-3.5 w-3.5" />
+              )}
+              Ask
+            </button>
+          </div>
+        </form>
+      </div>
+    </article>
+  );
 }
 
 const EMPTY_VALUES: Record<string, number | null> = Object.fromEntries([
@@ -717,6 +925,8 @@ export default function Home() {
                 </button>
               </footer>
             </article>
+
+            <LiteratureChatPanel report={report} />
 
             <DifferentialPanel dxs={dxs} />
           </div>

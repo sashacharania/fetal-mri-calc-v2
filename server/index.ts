@@ -15,6 +15,19 @@ const DEFAULT_RAG_REPO_DIR = path.resolve(
 );
 const RAG_TIMEOUT_MS = 30_000;
 
+type RagSource = {
+  citation: string;
+  sourceId: string;
+  title: string;
+  pageLabel: string;
+  score: number;
+};
+
+type RagResponse = {
+  answer: string;
+  sources: RagSource[];
+};
+
 const PYTHON_BRIDGE = String.raw`
 import json
 import sys
@@ -23,16 +36,36 @@ from pathlib import Path
 from fetal_rag.rag import TfidfRagEngine
 
 payload = json.loads(sys.stdin.read() or "{}")
-report = str(payload.get("report", "")).strip()
+question = str(payload.get("question", "")).strip()
+calculator_data = str(payload.get("calculator_data", "")).strip() or None
 index_dir = Path(payload.get("index_dir", "vector_db/fetal_mri"))
+top_k = int(payload.get("top_k", 6))
 
-question = (
-    "Provide concise literature context for this fetal brain MRI report.\n\n"
-    + report
-)
 engine = TfidfRagEngine.from_index(index_dir)
-result = engine.answer(question, calculator_data=report)
-sys.stdout.write(json.dumps({"answer": result.answer}))
+result = engine.answer(question, calculator_data=calculator_data, top_k=top_k)
+
+sources = []
+for index, context in enumerate(result.contexts, start=1):
+    chunk = context.chunk
+    if chunk.page_start is not None and chunk.page_end is not None:
+        page_label = (
+            f"p. {chunk.page_start}"
+            if chunk.page_start == chunk.page_end
+            else f"pp. {chunk.page_start}-{chunk.page_end}"
+        )
+    else:
+        page_label = ""
+    sources.append(
+        {
+            "citation": f"C{index}",
+            "sourceId": chunk.source_id,
+            "title": chunk.source_title or chunk.source_id,
+            "pageLabel": page_label,
+            "score": context.score,
+        }
+    )
+
+sys.stdout.write(json.dumps({"answer": result.answer, "sources": sources}))
 `;
 
 function resolveRagRepoDir() {
@@ -53,11 +86,17 @@ function resolvePythonBinary(ragRepoDir: string) {
   return "python3";
 }
 
-function runPythonRag(report: string, ragRepoDir: string) {
+function runPythonRag(
+  question: string,
+  ragRepoDir: string,
+  options: { calculatorData?: string; topK?: number } = {}
+) {
   const pythonBin = resolvePythonBinary(ragRepoDir);
   const indexDir = process.env.RAG_INDEX_DIR?.trim() || "vector_db/fetal_mri";
+  const calculatorData = options.calculatorData?.trim() || "";
+  const topK = options.topK ?? 6;
 
-  return new Promise<string>((resolve, reject) => {
+  return new Promise<RagResponse>((resolve, reject) => {
     const child = spawn(pythonBin, ["-c", PYTHON_BRIDGE], {
       cwd: ragRepoDir,
       env: {
@@ -109,8 +148,35 @@ function runPythonRag(report: string, ragRepoDir: string) {
         try {
           const parsed = JSON.parse(stdout.trim() || "{}") as {
             answer?: unknown;
+            sources?: unknown;
           };
-          resolve(typeof parsed.answer === "string" ? parsed.answer : "");
+          const sources = Array.isArray(parsed.sources)
+            ? parsed.sources
+                .map(source => {
+                  if (typeof source !== "object" || source === null) {
+                    return null;
+                  }
+                  const raw = source as Record<string, unknown>;
+                  return {
+                    citation:
+                      typeof raw.citation === "string" ? raw.citation : "",
+                    sourceId:
+                      typeof raw.sourceId === "string" ? raw.sourceId : "",
+                    title: typeof raw.title === "string" ? raw.title : "",
+                    pageLabel:
+                      typeof raw.pageLabel === "string" ? raw.pageLabel : "",
+                    score:
+                      typeof raw.score === "number"
+                        ? raw.score
+                        : Number(raw.score ?? 0),
+                  } as RagSource;
+                })
+                .filter((source): source is RagSource => source !== null)
+            : [];
+          resolve({
+            answer: typeof parsed.answer === "string" ? parsed.answer : "",
+            sources,
+          });
         } catch {
           reject(
             new Error(
@@ -123,8 +189,10 @@ function runPythonRag(report: string, ragRepoDir: string) {
 
     child.stdin.end(
       JSON.stringify({
-        report,
+        question,
+        calculator_data: calculatorData,
         index_dir: indexDir,
+        top_k: topK,
       })
     );
   });
@@ -141,11 +209,36 @@ function registerRagRoute(app: express.Express) {
     }
 
     try {
-      const answer = await runPythonRag(report, resolveRagRepoDir());
-      res.json({ answer });
+      const result = await runPythonRag(
+        "Provide concise literature context for this fetal brain MRI report.\n\n" +
+          report,
+        resolveRagRepoDir(),
+        { calculatorData: report }
+      );
+      res.json({ answer: result.answer });
     } catch (error) {
       console.error("RAG request failed:", error);
       res.json({ answer: "" });
+    }
+  });
+
+  app.post("/api/rag/chat", async (req, res) => {
+    const question =
+      typeof req.body?.question === "string" ? req.body.question : "";
+    const report = typeof req.body?.report === "string" ? req.body.report : "";
+    if (!question.trim()) {
+      res.json({ answer: "", sources: [] });
+      return;
+    }
+
+    try {
+      const result = await runPythonRag(question, resolveRagRepoDir(), {
+        calculatorData: report,
+      });
+      res.json(result);
+    } catch (error) {
+      console.error("RAG chat request failed:", error);
+      res.json({ answer: "", sources: [] });
     }
   });
 
