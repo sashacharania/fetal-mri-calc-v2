@@ -145,6 +145,19 @@ function DifferentialPanel({ dxs }: { dxs: Differential[] }) {
   );
 }
 
+function extractRagAnswer(payload: unknown): string {
+  if (
+    typeof payload !== "object" ||
+    payload === null ||
+    !("answer" in payload)
+  ) {
+    return "";
+  }
+
+  const answer = (payload as { answer?: unknown }).answer;
+  return typeof answer === "string" ? answer.trim() : "";
+}
+
 const EMPTY_VALUES: Record<string, number | null> = Object.fromEntries([
   ...PARAMETERS_ALL.map(p => [p.id, null]),
   ...AUXILIARY_MEASUREMENTS.map(field => [field.id, null]),
@@ -206,6 +219,7 @@ export default function Home() {
   const [motionSeverity, setMotionSeverity] = useState("None");
   const [focusedGroup, setFocusedGroup] = useState<string>("All");
   const [gaText, setGaText] = useState("");
+  const [ragAnswer, setRagAnswer] = useState("");
 
   const { zs, dxs } = useMemo(() => evaluateAll(values, ga), [values, ga]);
 
@@ -222,15 +236,56 @@ export default function Home() {
     [ga, fieldStrength, motionSeverity, values, zs, dxs]
   );
 
+  useEffect(() => {
+    setRagAnswer("");
+
+    const controller = new AbortController();
+    const timeoutId = window.setTimeout(() => {
+      void (async () => {
+        try {
+          const response = await fetch("/api/rag", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({ report }),
+            signal: controller.signal,
+          });
+
+          if (!response.ok) {
+            throw new Error(`RAG request failed with ${response.status}`);
+          }
+
+          const payload: unknown = await response.json();
+          if (!controller.signal.aborted) {
+            setRagAnswer(extractRagAnswer(payload));
+          }
+        } catch {
+          if (!controller.signal.aborted) {
+            setRagAnswer("");
+          }
+        }
+      })();
+    }, 400);
+
+    return () => {
+      controller.abort();
+      window.clearTimeout(timeoutId);
+    };
+  }, [report]);
+
   const measuredCount = Object.values(values).filter(v => v != null).length;
   const abnormalCount = PARAMETERS_ALL.filter(p => {
     const z = zs[p.id];
     return z != null && Math.abs(z.z) > 2;
   }).length;
+  const finalReport = ragAnswer
+    ? `${report}\n\nLiterature Context (RAG)\n${ragAnswer}`
+    : report;
 
   const handleCopy = async () => {
     try {
-      await copyReportPlainText(report);
+      await copyReportPlainText(finalReport);
       toast.success("Report copied to clipboard");
     } catch {
       toast.error("Unable to copy — select and copy manually");
@@ -649,7 +704,7 @@ export default function Home() {
               <textarea
                 aria-label="Structured report preview"
                 readOnly
-                value={report}
+                value={finalReport}
                 spellCheck={false}
                 className="block w-full h-[440px] resize-none border-0 bg-white px-5 py-4 text-[12.5px] leading-relaxed font-numeric text-[color:var(--ink)] outline-none overflow-auto"
               />
