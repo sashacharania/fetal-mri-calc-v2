@@ -166,6 +166,12 @@ function extractRagAnswer(payload: unknown): string {
   return typeof answer === "string" ? answer.trim() : "";
 }
 
+type RagDebug = {
+  fallbackUsed: boolean;
+  generationModel: string;
+  apiKeyLoaded: boolean;
+};
+
 type RagSource = {
   citation: string;
   title: string;
@@ -211,7 +217,48 @@ function extractRagSources(payload: unknown): RagSource[] {
     );
 }
 
-function LiteratureChatPanel({ report }: { report: string }) {
+function extractRagDebug(payload: unknown): RagDebug | null {
+  if (
+    typeof payload !== "object" ||
+    payload === null ||
+    !("debug" in payload) ||
+    typeof (payload as { debug?: unknown }).debug !== "object" ||
+    (payload as { debug?: unknown }).debug === null
+  ) {
+    return null;
+  }
+
+  const debug = (payload as { debug: Record<string, unknown> }).debug;
+  return {
+    fallbackUsed: Boolean(debug.fallback_used),
+    generationModel:
+      typeof debug.generation_model === "string" ? debug.generation_model : "",
+    apiKeyLoaded: Boolean(debug.api_key_loaded),
+  };
+}
+
+function RagFallbackBadge({ active }: { active: boolean }) {
+  if (!active) return null;
+
+  return (
+    <div className="rounded-sm border border-amber-300 bg-amber-50 px-2.5 py-1 text-[10px] leading-tight text-amber-900">
+      <div className="smallcaps tracking-[0.16em]">Retrieval-only fallback</div>
+      <div className="mt-0.5 text-[10px] normal-case tracking-normal">
+        Same indexed corpus, but Gemini is currently unavailable.
+      </div>
+    </div>
+  );
+}
+
+function LiteratureChatPanel({
+  report,
+  fallbackActive,
+  onFallbackModeChange,
+}: {
+  report: string;
+  fallbackActive: boolean;
+  onFallbackModeChange: (fallbackActive: boolean) => void;
+}) {
   const [messages, setMessages] = useState<ChatMessage[]>([
     {
       role: "assistant",
@@ -256,6 +303,10 @@ function LiteratureChatPanel({ report }: { report: string }) {
       const payload: unknown = await response.json();
       const answer = extractRagAnswer(payload);
       const sources = extractRagSources(payload);
+      const debug = extractRagDebug(payload);
+      if (debug) {
+        onFallbackModeChange(debug.fallbackUsed);
+      }
 
       setMessages(prev => [
         ...prev,
@@ -293,6 +344,7 @@ function LiteratureChatPanel({ report }: { report: string }) {
             RAG-backed literature assistant
           </div>
         </div>
+        <RagFallbackBadge active={fallbackActive} />
       </header>
 
       <div className="px-5 py-4 space-y-4">
@@ -428,6 +480,7 @@ export default function Home() {
   const [focusedGroup, setFocusedGroup] = useState<string>("All");
   const [gaText, setGaText] = useState("");
   const [ragAnswer, setRagAnswer] = useState("");
+  const [ragFallbackActive, setRagFallbackActive] = useState(false);
 
   const { zs, dxs } = useMemo(() => evaluateAll(values, ga), [values, ga]);
 
@@ -467,10 +520,13 @@ export default function Home() {
           const payload: unknown = await response.json();
           if (!controller.signal.aborted) {
             setRagAnswer(extractRagAnswer(payload));
+            const debug = extractRagDebug(payload);
+            setRagFallbackActive(Boolean(debug?.fallbackUsed));
           }
         } catch {
           if (!controller.signal.aborted) {
             setRagAnswer("");
+            setRagFallbackActive(false);
           }
         }
       })();
@@ -908,6 +964,7 @@ export default function Home() {
                     ESPR-style · PowerScribe-ready
                   </div>
                 </div>
+                <RagFallbackBadge active={ragFallbackActive} />
               </header>
               <textarea
                 aria-label="Structured report preview"
@@ -926,7 +983,11 @@ export default function Home() {
               </footer>
             </article>
 
-            <LiteratureChatPanel report={report} />
+            <LiteratureChatPanel
+              report={report}
+              fallbackActive={ragFallbackActive}
+              onFallbackModeChange={setRagFallbackActive}
+            />
 
             <DifferentialPanel dxs={dxs} />
           </div>
